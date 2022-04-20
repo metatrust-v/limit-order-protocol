@@ -8,6 +8,7 @@ import "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import "./helpers/AmountCalculator.sol";
+import "./helpers/RangeAmountCalculator.sol";
 import "./helpers/ChainlinkCalculator.sol";
 import "./helpers/NonceManager.sol";
 import "./helpers/PredicateHelper.sol";
@@ -19,6 +20,7 @@ import "./libraries/Permitable.sol";
 abstract contract OrderMixin is
     EIP712,
     AmountCalculator,
+    RangeAmountCalculator,
     ChainlinkCalculator,
     NonceManager,
     PredicateHelper,
@@ -65,6 +67,9 @@ abstract contract OrderMixin is
         uint256 takingAmount;
         bytes makerAssetData;
         bytes takerAssetData;
+        bytes getRangeMakerAmount;
+        uint256 priceRangeStart;
+        uint256 priceRangeEnd;
         bytes getMakerAmount; // this.staticcall(abi.encodePacked(bytes, swapTakerAmount)) => (swapMakerAmount)
         bytes getTakerAmount; // this.staticcall(abi.encodePacked(bytes, swapMakerAmount)) => (swapTakerAmount)
         bytes predicate;      // this.staticcall(bytes) => (bool)
@@ -200,12 +205,15 @@ abstract contract OrderMixin is
 
         {  // Stack too deep
             uint256 remainingMakerAmount = _remaining[orderHash];
+
             require(remainingMakerAmount != _ORDER_FILLED, "LOP: remaining amount is 0");
             require(order.allowedSender == address(0) || order.allowedSender == msg.sender, "LOP: private order");
+
             if (remainingMakerAmount == _ORDER_DOES_NOT_EXIST) {
                 // First fill: validate order and permit maker asset
                 require(SignatureChecker.isValidSignatureNow(order.maker, orderHash, signature), "LOP: bad signature");
                 remainingMakerAmount = order.makingAmount;
+
                 if (order.permit.length >= 20) {
                     // proceed only if permit length is enough to store address
                     (address token, bytes memory permit) = order.permit.decodeTargetAndCalldata();
@@ -224,22 +232,41 @@ abstract contract OrderMixin is
             // Compute maker and taker assets amount
             if ((takingAmount == 0) == (makingAmount == 0)) {
                 revert("LOP: only one amount should be 0");
-            } else if (takingAmount == 0) {
+            }
+
+            if (takingAmount == 0) {
                 uint256 requestedMakingAmount = makingAmount;
                 if (makingAmount > remainingMakerAmount) {
                     makingAmount = remainingMakerAmount;
                 }
+
+                // TODO: use getRangeMakerAmount
                 takingAmount = _callGetter(order.getTakerAmount, order.makingAmount, makingAmount, order.takingAmount);
+
                 // check that actual rate is not worse than what was expected
                 // takingAmount / makingAmount <= thresholdAmount / requestedMakingAmount
                 require(takingAmount * requestedMakingAmount <= thresholdAmount * makingAmount, "LOP: taking amount too high");
             } else {
                 uint256 requestedTakingAmount = takingAmount;
-                makingAmount = _callGetter(order.getMakerAmount, order.takingAmount, takingAmount, order.makingAmount);
+                if (order.getRangeMakerAmount.length == 0) {
+                    makingAmount = _callGetter(order.getMakerAmount, order.takingAmount, takingAmount, order.makingAmount);
+                } else {
+                    makingAmount = _callGetter(
+                        order.getRangeMakerAmount,
+                        order.priceRangeStart,
+                        order.priceRangeEnd,
+                        order.makingAmount,
+                        order.makingAmount - remainingMakerAmount,
+                        takingAmount
+                    );
+                }
+
                 if (makingAmount > remainingMakerAmount) {
                     makingAmount = remainingMakerAmount;
+                    // TODO: use getRangeMakerAmount
                     takingAmount = _callGetter(order.getTakerAmount, order.makingAmount, makingAmount, order.takingAmount);
                 }
+
                 // check that actual rate is not worse than what was expected
                 // makingAmount / takingAmount >= thresholdAmount / requestedTakingAmount
                 require(makingAmount * requestedTakingAmount >= thresholdAmount * takingAmount, "LOP: making amount too low");
